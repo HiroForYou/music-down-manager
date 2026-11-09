@@ -2,17 +2,28 @@ import { File } from 'expo-file-system';
 import * as ImagePicker from 'expo-image-picker';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
-import { Alert, FlatList, Image, KeyboardAvoidingView, Modal, Platform } from 'react-native';
+import { Alert, FlatList, Image, KeyboardAvoidingView, Modal, Platform, Pressable, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { Button, Cover, Field, Icon } from '../../components/ui';
 import { deleteTrack, downloadImageBytes, updateTrackMetadata } from '../../lib/download';
 import { searchCovers, type CoverResult } from '../../lib/itunes';
 import { getTrack } from '../../lib/library';
-import { Button } from '../../lib/tw/Button';
-import { Pressable, ScrollView, Text, TextInput, View } from '../../lib/tw';
+import { shareTrack } from '../../lib/share';
+import { colors, fonts } from '../../lib/theme';
 import type { Track } from '../../lib/types';
 
 type PendingCover = { kind: 'remote'; url: string } | { kind: 'local'; uri: string };
+
+function LinkAction({ label, onPress }: { label: string; onPress: () => void }) {
+  return (
+    <Pressable onPress={onPress} hitSlop={8}>
+      <Text style={{ fontFamily: fonts.sansSemi, fontSize: 15, color: colors.ink, borderBottomWidth: 1, borderBottomColor: colors.ink }}>
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
 
 export default function EditScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -57,24 +68,12 @@ export default function EditScreen() {
       setError('Se necesita permiso para acceder a tus fotos.');
       return;
     }
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      allowsEditing: true,
-      aspect: [1, 1],
-    });
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], allowsEditing: true, aspect: [1, 1] });
     if (result.canceled) return;
     const uri = result.assets[0].uri;
     setPendingCover({ kind: 'local', uri });
     setPreviewUri(uri);
   }, []);
-
-  const changeCover = useCallback(() => {
-    Alert.alert('Cambiar portada', undefined, [
-      { text: 'Elegir de galería', onPress: pickFromGallery },
-      { text: 'Buscar portada', onPress: () => setCoverSearchOpen(true) },
-      { text: 'Cancelar', style: 'cancel' },
-    ]);
-  }, [pickFromGallery]);
 
   const runSearch = useCallback(async () => {
     setSearching(true);
@@ -120,6 +119,15 @@ export default function EditScreen() {
     }
   }, [track, pendingCover, title, artist, album, router]);
 
+  const handleShare = useCallback(async () => {
+    if (!track) return;
+    try {
+      await shareTrack({ title: title.trim() || track.title, artist: artist.trim() || track.artist, fileUri: track.fileUri });
+    } catch (e) {
+      Alert.alert('No se pudo compartir', e instanceof Error ? e.message : String(e));
+    }
+  }, [track, title, artist]);
+
   const handleDelete = useCallback(() => {
     if (!track) return;
     Alert.alert('Eliminar canción', `¿Eliminar "${track.title}"? Esta acción no se puede deshacer.`, [
@@ -137,75 +145,52 @@ export default function EditScreen() {
 
   if (!track) {
     return (
-      <View className="flex-1 items-center justify-center bg-white">
-        <Text className="text-gray-500">Cargando…</Text>
+      <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.bg }}>
+        <Text style={{ fontFamily: fonts.serifItalic, fontSize: 15, color: colors.muted }}>Cargando…</Text>
       </View>
     );
   }
 
   return (
-    <View className="flex-1 bg-white">
-      <ScrollView className="flex-1" contentContainerClassName="gap-5 p-4">
-        <Pressable onPress={changeCover} className="self-center">
-          <View style={{ width: 160, height: 160 }}>
-            {previewUri ? (
-              <Image source={{ uri: previewUri }} style={{ width: 160, height: 160, borderRadius: 12 }} />
-            ) : (
-              <View className="h-40 w-40 items-center justify-center rounded-xl bg-gray-200">
-                <Text className="text-sm text-gray-400">Sin portada</Text>
-              </View>
-            )}
-            <View className="absolute bottom-1.5 right-1.5 h-8 w-8 items-center justify-center rounded-full bg-black/60">
-              <Text className="text-sm text-white">✎</Text>
-            </View>
-          </View>
+    <View style={{ flex: 1, backgroundColor: colors.bg, paddingTop: insets.top + 16, paddingBottom: insets.bottom + 16 }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 24, height: 44 }}>
+        <Pressable onPress={() => router.back()} hitSlop={12}>
+          <Icon name="chevron-left" size={26} />
         </Pressable>
-        <Text className="-mt-3 text-center text-xs text-gray-400">Toca la portada para cambiarla</Text>
-        <TextInput
-          className="rounded-xl border border-gray-300 px-4 py-3 text-base"
-          value={title}
-          onChangeText={setTitle}
-          placeholder="Título"
-        />
-        <TextInput
-          className="rounded-xl border border-gray-300 px-4 py-3 text-base"
-          value={artist}
-          onChangeText={setArtist}
-          placeholder="Artista"
-        />
-        <TextInput
-          className="rounded-xl border border-gray-300 px-4 py-3 text-base"
-          value={album}
-          onChangeText={setAlbum}
-          placeholder="Álbum (opcional)"
-        />
-        {error ? <Text className="text-red-600">{error}</Text> : null}
-        <Button label={busy ? 'Guardando…' : 'Guardar'} onPress={handleSave} disabled={busy} />
-        <Button label="Eliminar" variant="text" onPress={handleDelete} />
+        <Text style={{ fontFamily: fonts.sansSemi, fontSize: 12, letterSpacing: 1.4, color: colors.muted }}>EDITAR CANCIÓN</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 18 }}>
+          <Pressable onPress={handleShare} hitSlop={12}>
+            <Icon name="share-2" size={21} />
+          </Pressable>
+          <Pressable onPress={handleDelete} hitSlop={12}>
+            <Icon name="trash-2" size={22} color={colors.accent} />
+          </Pressable>
+        </View>
+      </View>
+
+      <ScrollView style={{ flex: 1 }} keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: 24, gap: 22 }}>
+        <View style={{ alignItems: 'center', gap: 16 }}>
+          <Cover uri={previewUri} size={160} seed={track.id} radius={4} />
+          <View style={{ flexDirection: 'row', gap: 24 }}>
+            <LinkAction label="Galería" onPress={pickFromGallery} />
+            <LinkAction label="Buscar en iTunes" onPress={() => setCoverSearchOpen(true)} />
+          </View>
+        </View>
+        <Field label="Título" value={title} onChangeText={setTitle} />
+        <Field label="Artista" value={artist} onChangeText={setArtist} />
+        <Field label="Álbum (opcional)" value={album} onChangeText={setAlbum} placeholder="Sin álbum" />
+        {error ? <Text style={{ fontFamily: fonts.sans, fontSize: 13, color: colors.accent }}>{error}</Text> : null}
       </ScrollView>
 
-      <Modal
-        visible={coverSearchOpen}
-        animationType="slide"
-        transparent
-        onRequestClose={() => setCoverSearchOpen(false)}
-      >
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          style={{ flex: 1, justifyContent: 'flex-end' }}
-        >
-          <Pressable className="flex-1 bg-black/40" onPress={() => setCoverSearchOpen(false)} />
-          <View
-            className="max-h-[75%] gap-3 rounded-t-2xl bg-white px-4 pt-4"
-            style={{ paddingBottom: insets.bottom + 16 }}
-          >
-            <TextInput
-              className="rounded-xl border border-gray-300 px-4 py-3 text-base"
-              value={query}
-              onChangeText={setQuery}
-              placeholder="Artista - título"
-              onSubmitEditing={runSearch}
-            />
+      <View style={{ paddingHorizontal: 24 }}>
+        <Button label={busy ? 'Guardando…' : 'Guardar'} onPress={handleSave} disabled={busy} />
+      </View>
+
+      <Modal visible={coverSearchOpen} animationType="slide" transparent onRequestClose={() => setCoverSearchOpen(false)}>
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ flex: 1, justifyContent: 'flex-end' }}>
+          <Pressable style={{ flex: 1, backgroundColor: 'rgba(20,33,43,0.4)' }} onPress={() => setCoverSearchOpen(false)} />
+          <View style={{ maxHeight: '75%', gap: 14, backgroundColor: colors.bg, paddingHorizontal: 24, paddingTop: 20, paddingBottom: insets.bottom + 16 }}>
+            <Field label="Artista - título" value={query} onChangeText={setQuery} onSubmitEditing={runSearch} returnKeyType="search" />
             <Button label={searching ? 'Buscando…' : 'Buscar'} onPress={runSearch} disabled={searching} />
             <FlatList
               style={{ flexGrow: 0 }}
@@ -215,16 +200,18 @@ export default function EditScreen() {
               windowSize={5}
               removeClippedSubviews
               keyboardShouldPersistTaps="handled"
-              ListEmptyComponent={<Text className="py-4 text-center text-gray-500">Busca un álbum</Text>}
+              ListEmptyComponent={
+                <Text style={{ paddingVertical: 16, textAlign: 'center', fontFamily: fonts.serifItalic, color: colors.muted }}>Busca un álbum</Text>
+              }
               renderItem={({ item }) => (
                 <Pressable
                   onPress={() => selectCover(item)}
-                  className="flex-row items-center gap-3 border-b border-gray-100 py-3 active:bg-gray-50"
+                  style={{ flexDirection: 'row', alignItems: 'center', gap: 14, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: colors.line }}
                 >
-                  <Image source={{ uri: item.thumbnailUrl }} style={{ width: 44, height: 44, borderRadius: 6 }} />
-                  <View className="flex-1">
-                    <Text className="font-medium text-gray-900">{item.title}</Text>
-                    <Text className="text-sm text-gray-500">{item.artist}</Text>
+                  <Image source={{ uri: item.thumbnailUrl }} style={{ width: 44, height: 44, borderRadius: 3 }} />
+                  <View style={{ flex: 1 }}>
+                    <Text numberOfLines={1} style={{ fontFamily: fonts.serif, fontSize: 16, color: colors.ink }}>{item.title}</Text>
+                    <Text numberOfLines={1} style={{ fontFamily: fonts.sans, fontSize: 13, color: colors.muted }}>{item.artist}</Text>
                   </View>
                 </Pressable>
               )}

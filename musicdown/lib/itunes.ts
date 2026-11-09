@@ -1,3 +1,5 @@
+import { getPowerPrefs } from './powerPrefs';
+
 export interface CoverResult {
   id: string;
   title: string;
@@ -20,6 +22,7 @@ interface ITunesRawResult {
 export async function searchCovers(query: string): Promise<CoverResult[]> {
   const trimmed = query.trim();
   if (!trimmed) return [];
+  if (getPowerPrefs().offlineMode) throw new Error('Modo sin conexión activado: no se pueden buscar portadas.');
 
   const url = `https://itunes.apple.com/search?media=music&entity=album&limit=12&term=${encodeURIComponent(trimmed)}`;
   const response = await fetch(url);

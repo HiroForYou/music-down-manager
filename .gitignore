@@ -53,3 +53,6 @@ out/
 skills-lock.json
 .help
 download-base-mp3.js
+
+# Server runtime data (Spotify likes snapshot)
+server/data/

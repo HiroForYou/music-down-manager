@@ -1,4 +1,6 @@
 overrides:
   lightningcss: "1.30.1"
 patchedDependencies:
+  expo-audio@1.1.1: patches/expo-audio@1.1.1.patch
   expo-media-library: patches/expo-media-library.patch
+  react-native-webview@13.15.0: patches/react-native-webview@13.15.0.patch

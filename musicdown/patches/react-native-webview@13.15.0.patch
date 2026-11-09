@@ -1,0 +1,20 @@
+diff --git a/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java b/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
+index 5932fc189d192cfd1209509170c816ddcaed0a10..cf2bc41630e20c337b7b28281f4e45434359bce4 100644
+--- a/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
++++ b/android/src/main/java/com/reactnativecommunity/webview/RNCWebView.java
+@@ -121,6 +121,15 @@ public class RNCWebView extends WebView implements LifecycleEventListener {
+         // do nothing
+     }
+ 
++    // Patched (musicdown): al bloquear la pantalla o pasar la app a segundo plano, Android avisa a la
++    // WebView que su ventana dejó de ser visible y Chromium pausa los videos con imagen (solo deja seguir
++    // el audio puro). Para que la música de YouTube siga sonando con la pantalla bloqueada, la WebView
++    // siempre se considera visible.
++    @Override
++    protected void onWindowVisibilityChanged(int visibility) {
++        super.onWindowVisibilityChanged(View.VISIBLE);
++    }
++
+     @Override
+     public void onHostDestroy() {
+         cleanupCallbacksAndDestroy();

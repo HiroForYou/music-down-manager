@@ -1,12 +1,19 @@
 {
   "name": "musicdown-server",
   "version": "1.0.0",
+  "license": "MIT",
   "private": true,
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node --env-file=.env server.js",
+    "start:tunnel": "node --env-file=.env scripts/start-with-tunnel.js",
+    "tunnel": "node --env-file=.env scripts/start-with-tunnel.js"
   },
   "dependencies": {
     "express": "^4.19.2"
+  },
+  "packageManager": "pnpm@11.5.2",
+  "engines": {
+    "node": ">=22"
   }
 }

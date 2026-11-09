@@ -3,10 +3,20 @@ import * as MediaLibrary from 'expo-media-library';
 import { Asset as NextAsset } from 'expo-media-library/next';
 
 import { writeMp3Tags } from './id3';
+import { readId3 } from './id3Read';
 import { addTrack, getTrack, listTracks, removeTrack, updateTrack } from './library';
 import { detectLinkKind } from './linkKind';
+import { getHideDownloads } from './privacy';
+import { emitTrackDeleted } from './trackEvents';
 import { getServerSettings } from './settings';
+import type { SpotifyLikedTrack } from './spotify';
 import type { Track } from './types';
+
+/**
+ * Extensión "disfrazada" (ROT13 de "mp3") para las descargas ocultas: los archivos siguen siendo MP3 y
+ * suenan igual (el reproductor detecta el formato por el contenido), pero otras apps no los reconocen.
+ */
+export const HIDDEN_EXTENSION = '.zc3';
 
 function generateId(): string {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
@@ -91,6 +101,23 @@ async function pollJobProgress(
   }
 }
 
+async function explainDownloadFailure(base: string, apiKey: string, cause: unknown): Promise<string> {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  try {
+    const health = await fetch(`${base}/api/health`);
+    if (!health.ok) return `El servidor respondió ${health.status} al comprobar su estado.`;
+  } catch {
+    return `No se pudo conectar con el servidor (${base}). ¿Está encendido y la URL de Ajustes es la actual?`;
+  }
+  try {
+    const auth = await fetch(`${base}/api/progress?jobId=check`, { headers: apiKey ? { 'x-api-key': apiKey } : undefined });
+    if (auth.status === 401) return 'El servidor rechazó la clave de acceso. Revisa la "Clave de acceso" en Ajustes.';
+  } catch {
+    // Ya se comprobó que el servidor responde.
+  }
+  return `La descarga falló: ${detail}`;
+}
+
 async function downloadYoutubeAudio(
   sourceUrl: string,
   destination: Directory,
@@ -108,10 +135,20 @@ async function downloadYoutubeAudio(
     : Promise.resolve();
 
   try {
-    return (await File.downloadFileAsync(endpoint, destination, {
-      idempotent: true,
-      headers: apiKey ? { 'x-api-key': apiKey } : undefined,
-    })) as File;
+    // fetch (y no File.downloadFileAsync): este último corta a los ~10 s sin recibir bytes y el servidor
+    // tarda más que eso en empezar a enviar el MP3 (yt-dlp busca y descarga, ffmpeg convierte).
+    const response = await fetch(endpoint, { headers: apiKey ? { 'x-api-key': apiKey } : undefined });
+    if (!response.ok) throw new Error(`El servidor respondió ${response.status}`);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.length === 0) throw new Error('El servidor devolvió un archivo vacío');
+    const file = new File(destination, `${jobId}.mp3`);
+    if (file.exists) file.delete();
+    file.create();
+    file.write(bytes);
+    return file;
+  } catch (e) {
+    // downloadFileAsync solo dice "rejected": se comprueba qué falló realmente (servidor, clave o conversión).
+    throw new Error(await explainDownloadFailure(base, apiKey, e));
   } finally {
     polling = false;
     await pollPromise;
@@ -194,6 +231,8 @@ export interface ExternalAudioItem {
   title: string;
   artist: string;
   fileUri: string;
+  /** Extensión del archivo original en minúsculas, sin punto (p. ej. "mp3"). */
+  extension: string;
 }
 
 /**
@@ -218,12 +257,21 @@ export async function listAllMusicFolderAudio(excludeMediaAssetIds: Set<string>)
     album = null;
   }
 
-  const { assets } = await MediaLibrary.getAssetsAsync({
-    mediaType: 'audio',
-    album: album ?? undefined,
-    first: 500,
-    sortBy: [['creationTime', false]],
-  });
+  // Se leen todas las páginas (antes solo las primeras 500, y la lista se quedaba corta).
+  const assets: MediaLibrary.Asset[] = [];
+  let after: string | undefined;
+  for (let page = 0; page < 200; page++) {
+    const result = await MediaLibrary.getAssetsAsync({
+      mediaType: 'audio',
+      album: album ?? undefined,
+      first: 500,
+      after,
+      sortBy: [['creationTime', false]],
+    });
+    assets.push(...result.assets);
+    if (!result.hasNextPage) break;
+    after = result.endCursor;
+  }
 
   return assets
     .filter((asset) => !excludeMediaAssetIds.has(asset.id))
@@ -232,10 +280,127 @@ export async function listAllMusicFolderAudio(excludeMediaAssetIds: Set<string>)
       title: asset.filename.replace(/\.[^.]+$/, ''),
       artist: 'Desconocido',
       fileUri: asset.uri,
+      extension: (asset.filename.split('.').pop() ?? '').toLowerCase(),
     }));
 }
 
-export async function deleteExternalAsset(mediaAssetId: string): Promise<void> {
+/** ¿Ya hay permiso de lectura de audio? (sin preguntar). Sirve para refrescar el escaneo en silencio. */
+export async function hasAudioPermission(): Promise<boolean> {
+  try {
+    return (await MediaLibrary.getPermissionsAsync(false, ['audio'])).granted;
+  } catch {
+    return false;
+  }
+}
+
+export interface MoveResult {
+  /** Canciones que ahora viven en la carpeta Música como .mp3 (ya no ocupan espacio dos veces). */
+  moved: number;
+  /** Se publicaron en Música, pero la copia privada se conservó porque no se pudo verificar el archivo nuevo. */
+  keptCopy: number;
+  skipped: number;
+  errors: string[];
+}
+
+/**
+ * Mueve descargas de la app a la carpeta Música del teléfono como archivos .mp3 normales (las ocultas .zc3
+ * dejan de serlo). La canción sigue en la biblioteca, ahora apuntando al archivo de Música. El archivo
+ * privado solo se borra después de comprobar que la copia nueva existe y pesa lo mismo.
+ */
+export async function moveTracksToMusic(ids: string[], onProgress?: (done: number, total: number) => void): Promise<MoveResult> {
+  const result: MoveResult = { moved: 0, keptCopy: 0, skipped: 0, errors: [] };
+  const permission = await MediaLibrary.requestPermissionsAsync(true);
+  if (!permission.granted) throw new Error('Falta el permiso para guardar en la carpeta Música.');
+
+  let done = 0;
+  for (const id of ids) {
+    const track = await getTrack(id);
+    done += 1;
+    if (!track || track.inMusic) {
+      result.skipped += 1;
+      onProgress?.(done, ids.length);
+      continue;
+    }
+    try {
+      const source = new File(track.fileUri);
+      if (!source.exists) throw new Error('el archivo ya no existe');
+
+      // Si ya se había publicado una copia (descargas no ocultas), se reutiliza en vez de duplicarla otra vez.
+      let assetId = track.mediaAssetId;
+      let publicUri: string | null = null;
+      if (assetId) {
+        try {
+          publicUri = (await MediaLibrary.getAssetInfoAsync(assetId))?.localUri ?? null;
+        } catch {
+          publicUri = null;
+        }
+        if (!publicUri) assetId = null;
+      }
+      if (!assetId) {
+        // Se publica con nombre "Título.mp3" (el nombre del archivo es el que verá cualquier otra app).
+        const temp = uniqueFile(tempDirectory(), sanitizeFilename(track.title), '.mp3');
+        source.copy(temp);
+        try {
+          const asset = await MediaLibrary.createAssetAsync(temp.uri);
+          assetId = asset.id;
+          publicUri = asset.uri;
+        } finally {
+          try {
+            if (temp.exists) temp.delete();
+          } catch {
+            // La caché se limpia sola.
+          }
+        }
+      }
+
+      let verified = false;
+      if (publicUri) {
+        try {
+          const published = new File(publicUri);
+          verified = published.exists && published.size === source.size;
+        } catch {
+          verified = false;
+        }
+      }
+      if (verified && publicUri) {
+        await updateTrack(id, { fileUri: publicUri, mediaAssetId: assetId, inMusic: true });
+        try {
+          source.delete();
+        } catch {
+          // Si no se pudo borrar, solo queda un archivo huérfano en el almacenamiento privado.
+        }
+        result.moved += 1;
+      } else {
+        await updateTrack(id, { mediaAssetId: assetId });
+        result.keptCopy += 1;
+      }
+    } catch (e) {
+      result.errors.push(`"${track.title}": ${e instanceof Error ? e.message : String(e)}`);
+    }
+    onProgress?.(done, ids.length);
+  }
+  return result;
+}
+
+/** El id de MediaLibrary es solo el número; la API "next" exige la URI de contenido del archivo. */
+function audioContentUri(mediaAssetId: string): string {
+  return /^content:/.test(mediaAssetId) ? mediaAssetId : `content://media/external/audio/media/${mediaAssetId}`;
+}
+
+/**
+ * Elimina archivos de audio que la app no creó. Android pide una confirmación del sistema, y con varios
+ * archivos en una sola llamada aparece un único diálogo para todo el lote.
+ */
+export async function deleteExternalAssets(mediaAssetIds: string[]): Promise<void> {
+  if (mediaAssetIds.length === 0) return;
+  // Permiso de audio: si no está concedido se pide aquí; si el sistema ya no deja preguntar, hay que
+  // concederlo a mano en Ajustes del teléfono.
+  const permission = await MediaLibrary.requestPermissionsAsync(false, ['audio']);
+  if (!permission.granted) {
+    throw new Error(
+      'Falta el permiso de música y audio. Concédelo en Ajustes del teléfono > Apps > MusicDown > Permisos > Música y audio.'
+    );
+  }
   // The legacy deleteAssetsAsync() doesn't implement Android 11+'s required
   // user-consent flow for deleting media this app doesn't own (files found
   // via the "Todas" scan) — it can silently no-op instead of deleting.
@@ -245,7 +410,56 @@ export async function deleteExternalAsset(mediaAssetId: string): Promise<void> {
   // can only be granted through the photo/video picker flow and is therefore
   // impossible to satisfy for an audio-only app — patched out via pnpm
   // (patches/expo-media-library.patch).
-  await NextAsset.delete([new NextAsset(mediaAssetId)]);
+  try {
+    await NextAsset.delete(mediaAssetIds.map((id) => new NextAsset(audioContentUri(id))));
+  } catch (e) {
+    // Tras aceptar el diálogo, el sistema ya borró los archivos; la librería intenta borrarlos otra vez y
+    // falla con SecurityException ("has no access to ..."). Si realmente ya no existen, el borrado funcionó.
+    const stillThere: string[] = [];
+    for (const id of mediaAssetIds) {
+      try {
+        const info = await MediaLibrary.getAssetInfoAsync(id);
+        if (info) stillThere.push(id);
+      } catch {
+        // No se puede consultar: se asume que ya no existe (si existiera, la consulta habría respondido).
+      }
+    }
+    if (stillThere.length > 0) throw e;
+  }
+}
+
+export async function deleteExternalAsset(mediaAssetId: string): Promise<void> {
+  await deleteExternalAssets([mediaAssetId]);
+}
+
+/** "Artista - Título" -> {artist, title}; si no sigue ese patrón, todo es el título. */
+function parseFilename(name: string): { title: string; artist: string } {
+  const match = /^(.+?)\s+[-–]\s+(.+)$/.exec(name);
+  return match ? { artist: match[1].trim(), title: match[2].trim() } : { title: name.trim() || 'Pista sin título', artist: 'Desconocido' };
+}
+
+/**
+ * Importa un MP3 de la carpeta Música (que la app no creó y por eso no puede editar) como copia propia de la
+ * app, con título, artista y portada editables. El original no se toca: el borrado, si se quiere, es aparte.
+ */
+export async function importExternalTrack(item: ExternalAudioItem): Promise<Track> {
+  if (item.extension !== 'mp3') {
+    throw new Error(`Solo se pueden importar archivos MP3 ("${item.title}" es .${item.extension || '?'}).`);
+  }
+  const temp = new File(tempDirectory(), `import-${generateId()}.mp3`);
+  new File(item.fileUri).copy(temp);
+  // Se conservan las etiquetas y la portada que el archivo ya traía; el nombre del archivo solo es respaldo.
+  const tags = await readId3(item.fileUri);
+  const fromName = parseFilename(item.title);
+  return finalizeTrack({
+    id: generateId(),
+    title: tags?.title ?? fromName.title,
+    artist: tags?.artist ?? fromName.artist,
+    album: tags?.album ?? '',
+    coverBytes: tags?.cover?.bytes,
+    sourceUrl: `import:${item.mediaAssetId}`,
+    downloadedFile: temp,
+  });
 }
 
 export async function downloadTrack(sourceUrl: string, onProgress?: (percent: number) => void): Promise<Track> {
@@ -270,12 +484,33 @@ export async function downloadTrack(sourceUrl: string, onProgress?: (percent: nu
     if (guessedName) title = guessedName;
   }
 
+  return finalizeTrack({ id, title, artist, album: '', coverBytes, sourceUrl, downloadedFile });
+}
+
+interface FinalizeInput {
+  id: string;
+  title: string;
+  artist: string;
+  album: string;
+  coverBytes?: Uint8Array;
+  sourceUrl: string;
+  downloadedFile: File;
+  spotifyId?: string;
+}
+
+/** Etiqueta el MP3 descargado, lo guarda (público o disfrazado, según Ajustes) y lo registra en la biblioteca. */
+async function finalizeTrack(input: FinalizeInput): Promise<Track> {
+  const { id, title, artist, album, coverBytes, sourceUrl, downloadedFile, spotifyId } = input;
+
   const rawBytes = await downloadedFile.bytes();
   downloadedFile.delete();
 
-  const taggedBytes = writeMp3Tags(rawBytes, { title, artist, coverBytes });
+  const taggedBytes = writeMp3Tags(rawBytes, { title, artist, album: album || undefined, coverBytes });
 
-  const finalFile = uniqueFile(tracksDirectory(), sanitizeFilename(title), '.mp3');
+  // Ocultas (por defecto): almacenamiento privado de la app, extensión disfrazada y sin publicar en la
+  // biblioteca multimedia del teléfono, así que ninguna otra app las ve.
+  const hidden = getHideDownloads();
+  const finalFile = uniqueFile(tracksDirectory(), sanitizeFilename(title), hidden ? HIDDEN_EXTENSION : '.mp3');
   finalFile.create();
   finalFile.write(taggedBytes);
 
@@ -288,22 +523,44 @@ export async function downloadTrack(sourceUrl: string, onProgress?: (percent: nu
     coverUri = coverFile.uri;
   }
 
-  const mediaAssetId = await publishToMediaLibrary(finalFile);
+  const mediaAssetId = hidden ? null : await publishToMediaLibrary(finalFile);
 
   const track: Track = {
     id,
     title,
     artist,
-    album: '',
+    album,
     coverUri,
     fileUri: finalFile.uri,
     mediaAssetId,
     sourceUrl,
     createdAt: Date.now(),
+    ...(spotifyId ? { spotifyId } : {}),
   };
 
   await addTrack(track);
   return track;
+}
+
+/** Descarga un like de Spotify buscando "artista título" en YouTube (vía el servidor). */
+export async function downloadSpotifyLike(like: SpotifyLikedTrack, onProgress?: (percent: number) => void): Promise<Track> {
+  const id = generateId();
+  const temp = tempDirectory();
+  // La portada de 640 px de Spotify (las listas usan variantes pequeñas).
+  const coverUrl = like.image ? like.image.replace(/ab67616d0000(1e02|4851)/, 'ab67616d0000b273') : null;
+  const coverBytes = coverUrl ? (await downloadImageBytes(coverUrl)) ?? undefined : undefined;
+  const query = `ytsearch1:${like.artists} ${like.name}`;
+  const downloadedFile = await downloadYoutubeAudio(query, temp, sanitizeFilename(`${like.artists} - ${like.name}`), onProgress);
+  return finalizeTrack({
+    id,
+    title: like.name,
+    artist: like.artists,
+    album: like.album,
+    coverBytes,
+    sourceUrl: like.url,
+    downloadedFile,
+    spotifyId: like.id,
+  });
 }
 
 export interface MetadataPatch {
@@ -344,8 +601,13 @@ export async function updateTrackMetadata(id: string, patch: MetadataPatch): Pro
     coverUri = coverFile.uri;
   }
 
-  await unpublishFromMediaLibrary(existing.mediaAssetId);
-  const mediaAssetId = await publishToMediaLibrary(file);
+  // Las descargas ocultas nunca se publican en la biblioteca multimedia.
+  const hidden = existing.fileUri.endsWith(HIDDEN_EXTENSION);
+  let mediaAssetId = existing.mediaAssetId;
+  if (!hidden && !existing.inMusic) {
+    await unpublishFromMediaLibrary(existing.mediaAssetId);
+    mediaAssetId = await publishToMediaLibrary(file);
+  }
 
   const updated = await updateTrack(id, {
     title: patch.title,
@@ -364,6 +626,8 @@ export async function deleteTrack(id: string): Promise<void> {
   const existing = await getTrack(id);
   if (!existing) return;
 
+  // Si el archivo vive en Música, se quita primero de la biblioteca multimedia (que lo borra del teléfono).
+  if (existing.inMusic) await unpublishFromMediaLibrary(existing.mediaAssetId);
   try {
     new File(existing.fileUri).delete();
   } catch {
@@ -376,8 +640,9 @@ export async function deleteTrack(id: string): Promise<void> {
       // Already removed from disk — nothing to do.
     }
   }
-  await unpublishFromMediaLibrary(existing.mediaAssetId);
+  if (!existing.inMusic) await unpublishFromMediaLibrary(existing.mediaAssetId);
   await removeTrack(id);
+  emitTrackDeleted(id);
 }
 
 export async function clearLibrary(): Promise<void> {
